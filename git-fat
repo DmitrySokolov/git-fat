@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# -*- mode: python -*-
+# -*- mode:python -*-
 
 from __future__ import print_function, with_statement
 
@@ -14,6 +14,31 @@ import itertools
 import threading
 import time
 import collections
+
+try:
+    from subprocess import check_output
+    del check_output
+except ImportError:
+    def backport_check_output(*popenargs, **kwargs):
+        r"""Run command with arguments and return its output as a byte string.
+
+        Backported from Python 2.7 as it's implemented as pure python on stdlib.
+
+        >>> check_output(['/usr/bin/python', '--version'])
+        Python 2.6.2
+        """
+        process = subprocess.Popen(stdout=subprocess.PIPE, *popenargs, **kwargs)
+        output, unused_err = process.communicate()
+        retcode = process.poll()
+        if retcode:
+            cmd = kwargs.get("args")
+            if cmd is None:
+                cmd = popenargs[0]
+            error = subprocess.CalledProcessError(retcode, cmd)
+            error.output = output
+            raise error
+        return output
+    subprocess.check_output = backport_check_output
 
 BLOCK_SIZE = 4096
 
@@ -48,6 +73,12 @@ def mkdir_p(path):
         if exc.errno == errno.EEXIST and os.path.isdir(path):
             pass
         else: raise
+
+def umask():
+    """Get umask without changing it."""
+    old = os.umask(0)
+    os.umask(old)
+    return old
 
 def readblocks(stream):
     bytecount = 0
@@ -177,11 +208,14 @@ class GitFat(object):
             return itertools.chain([preamble], readblocks(stream)), None
     def decode_file(self, fname):
         # Fast check
-        stat = os.stat(fname)
+        stat = os.lstat(fname)
         if stat.st_size != self.magiclen:
             return False, None
         # read file
-        digest, bytecount = self.decode_stream(open(fname, 'rb'))
+        try:
+            digest, bytecount = self.decode_stream(open(fname, 'rb'))
+        except IOError:
+            return False, None
         if isinstance(digest, bytes):
             return digest, bytecount
         else:
@@ -224,6 +258,8 @@ class GitFat(object):
                     self.verbose('git-fat filter-clean: cache already exists:', objfile)
                     os.remove(tmpname)
                 else:
+                    # Set permissions for the new file using the current umask
+                    os.chmod(tmpname, int('444', 8) & ~umask())
                     os.rename(tmpname, objfile)
                     self.verbose('git-fat filter-clean: caching to:', objfile)
                 cached = True
@@ -288,12 +324,14 @@ class GitFat(object):
         p1.wait()
         p2.wait()
         return referenced
-    def orphan_files(self):
+
+    def orphan_files(self, patterns=[]):
         'generator for all orphan placeholders in the working tree'
-        for fname in subprocess.check_output(['git', 'ls-files']).splitlines():
+        for fname in subprocess.check_output(['git', 'ls-files', '-z'] + patterns).split('\x00')[:-1]:
             digest = self.decode_file(fname)[0]
             if digest:
                 yield (digest, fname)
+
     def cmd_status(self, args):
         self.setup()
         catalog = self.catalog_objects()
@@ -356,14 +394,33 @@ class GitFat(object):
             rev = self.revparse(arg)
             if rev:
                 refargs['rev'] = rev
-        files = self.referenced_objects(**refargs) - self.catalog_objects()
+        files = self.filter_objects(refargs, self.parse_pull_patterns(args))
         cmd = self.get_rsync_command(push=False)
         self.verbose('Executing:', b' '.join(cmd))
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         p.communicate(input=(b'\x00'.join(files)))
         self.checkout()
+
+    def parse_pull_patterns(self, args):
+        if '--' not in args:
+            return ['']
+        else:
+            idx = args.index('--')
+            patterns  = args[idx+1:] #we don't care about '--'
+            return patterns
+
+    def filter_objects(self, refargs, patterns):
+        files = self.referenced_objects(**refargs) - self.catalog_objects()
+        files_set = set(files)
+        orphans_matched = list(self.orphan_files(patterns))
+        print("pulling:")
+        print(map(lambda x: x[1], orphans_matched))
+        orphans_objects = set(map(lambda x: x[0], orphans_matched))
+        return files_set & orphans_objects
+
     def cmd_checkout(self, args):
         self.checkout(show_orphans=True)
+
     def cmd_gc(self):
         garbage = self.catalog_objects() - self.referenced_objects()
         print('Unreferenced objects to remove: %d' % len(garbage))
@@ -443,6 +500,9 @@ class GitFat(object):
             stageno, sep, tail = tail.partition(b'\t')
             filename = tail.strip()
             if filename not in filelist:
+                continue
+            if mode == "120000":
+                # skip symbolic links
                 continue
             # This file will contain the hash of the cleaned object
             hashfile = os.path.join(self.gitdir, b'fat', b'index-filter', blobhash)

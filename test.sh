@@ -34,6 +34,9 @@ EOF
 git add .gitattributes .gitfat
 git commit -m'Initial fat repository'
 # Add content to repo
+ln -s /oe/dss-oe/dss-add-ons-testing-build/deploy/licenses/common-licenses/GPL-3 c
+git add c
+git commit -m'add broken symlink'
 echo 'fat content a' > a.fat
 git add a.fat
 git commit -m'add a.fat'
@@ -53,4 +56,6 @@ cd ..
 git clone fat-test fat-test2
 cd fat-test2
 git fat init
-git fat pull
+git fat pull -- 'a.fa*'
+cat a.fat
+
